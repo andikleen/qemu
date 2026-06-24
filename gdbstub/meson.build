@@ -34,6 +34,8 @@ user_ss.add(files(
   'user.c'
 ))
 
+specific_ss.add(files('pt.c'))
+
 system_ss.add(files(
   'gdbstub.c',
   'syscalls.c',

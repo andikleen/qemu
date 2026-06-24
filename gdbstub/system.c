@@ -32,6 +32,7 @@
 #include "monitor/monitor.h"
 #include "trace.h"
 #include "internals.h"
+#include "pt.h"
 
 /* System emulation specific state */
 typedef struct {
@@ -383,6 +384,7 @@ bool gdbserver_start(const char *device, Error **errp)
 
     if (!gdbserver_state.init) {
         gdb_init_gdbserver_state();
+        gdb_pt_register();
 
         qemu_add_vm_change_state_handler(gdb_vm_state_change, NULL);
 

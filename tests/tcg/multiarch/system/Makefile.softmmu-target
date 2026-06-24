@@ -68,6 +68,21 @@ run-gdbstub-%:
 	$(call skip-test, "gdbstub test $*", "need working gdb with $(patsubst -%,,$(TARGET_NAME)) support")
 endif
 
+# x86_64-specific: Intel Processor Trace gdbstub test
+ifeq ($(TARGET_NAME),x86_64)
+run-gdbstub-pt: memory
+	$(call run-test, $@, $(GDB_SCRIPT) \
+		--gdb $(GDB) \
+		--qemu $(QEMU) \
+		--output $<.pt.gdb.out \
+		--no-suspend \
+		--qargs \
+		"-cpu qemu64 -monitor none -display none -chardev file$(COMMA)path=$<.out$(COMMA)id=output $(QEMU_OPTS)" \
+		--bin $< --test $(SRC_PATH)/tests/tcg/x86_64/gdbstub/test-pt.py, \
+	softmmu gdbstub pt support)
+MULTIARCH_RUNS += run-gdbstub-pt
+endif
+
 MULTIARCH_RUNS += run-gdbstub-memory run-gdbstub-interrupt \
 	run-gdbstub-untimely-packet run-gdbstub-registers
 
