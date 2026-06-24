@@ -55,6 +55,16 @@ typedef struct {
 
 static GDBPTSession pt_session;
 
+static GString *btrace_cache;
+
+static void btrace_cache_clear(void)
+{
+    if (btrace_cache) {
+        g_string_free(btrace_cache, TRUE);
+        btrace_cache = NULL;
+    }
+}
+
 static int read_sysfs_int(const char *path, uint32_t *val)
 {
     int ret = -1;
@@ -214,7 +224,8 @@ static void gdb_pt_free_vcpu_buffers(CPUState *cpu)
 
 static const char gdb_pt_hex[] = "0123456789abcdef";
 
-static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu)
+static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu,
+                                  bool update_last_head)
 {
     GDBPTVCPUState *vcpu = &pt_session.vcpu[cpu->cpu_index];
     struct perf_event_mmap_page *header;
@@ -256,17 +267,20 @@ static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu)
         g_string_append_c(buf, gdb_pt_hex[byte & 0xf]);
     }
 
-    vcpu->last_head = aux_head;
+    if (update_last_head) {
+        vcpu->last_head = aux_head;
+    }
 }
 
-static void gdb_pt_build_btrace_xml(GString *xml, CPUState *cpu)
+static void gdb_pt_build_btrace_xml(GString *xml, CPUState *cpu,
+                                     bool update_last_head)
 {
     /* Preallocate for worst-case hex encoding: each AUX byte → "XX " (3 chars),
      * plus newline+indent every 32 lines, plus XML wrappers ~300 bytes. */
     g_autoptr(GString) raw = g_string_sized_new(
         pt_session.buffer_size * 3 + pt_session.buffer_size / 32 * 7 + 300);
 
-    gdb_pt_read_vcpu_raw(raw, cpu);
+    gdb_pt_read_vcpu_raw(raw, cpu, update_last_head);
 
     g_string_printf(xml,
         "<!DOCTYPE btrace SYSTEM \"btrace.dtd\">\n"
@@ -304,6 +318,21 @@ static void gdb_handle_qbtrace_conf_pt_size(GArray *params, void *user_ctx)
     gdb_put_packet("OK");
 }
 
+/* Parse a boolean config value from GDB.  GDB may send "yes", "no", "on",
+ * "off", or quoted "\"yes\""/"\"no\"".  Returns true for truthy values. */
+static bool gdb_pt_parse_bool(const char *val)
+{
+    if (!val) {
+        return false;
+    }
+    /* Strip surrounding double quotes if present */
+    while (*val == '"') {
+        val++;
+    }
+    return strcmp(val, "yes") == 0 || strcmp(val, "on") == 0 ||
+           strcmp(val, "1") == 0;
+}
+
 static void gdb_handle_qbtrace_conf_pt_ptwrite(GArray *params, void *user_ctx)
 {
     if (!params->len) {
@@ -312,7 +341,7 @@ static void gdb_handle_qbtrace_conf_pt_ptwrite(GArray *params, void *user_ctx)
     }
 
     const char *val = gdb_get_cmd_param(params, 0)->data;
-    pt_session.ptwrite = (strcmp(val, "on") == 0);
+    pt_session.ptwrite = gdb_pt_parse_bool(val);
     gdb_put_packet("OK");
 }
 
@@ -324,24 +353,30 @@ static void gdb_handle_qbtrace_conf_pt_event(GArray *params, void *user_ctx)
     }
 
     const char *val = gdb_get_cmd_param(params, 0)->data;
-    pt_session.event_tracing = (strcmp(val, "on") == 0);
+    pt_session.event_tracing = gdb_pt_parse_bool(val);
     gdb_put_packet("OK");
 }
 
 static void gdb_handle_qbtrace_pt(GArray *params, void *user_ctx)
 {
     CPUState *cpu;
-    int ret;
+    int ret, enabled_count = 0;
 
     if (pt_session.active) {
         gdb_put_packet("OK");
         return;
     }
 
-    /* Free any leftover buffers from a previous session */
-    CPU_FOREACH(cpu) {
-        gdb_pt_free_vcpu_buffers(cpu);
+    /* gdb_pt_cleanup_all may have freed the vcpu array; re-allocate. */
+    if (!pt_session.vcpu) {
+        int n = gdb_get_max_cpus();
+        pt_session.vcpu = g_new0(GDBPTVCPUState, n);
+        for (int i = 0; i < n; i++) {
+            pt_session.vcpu[i].perf_fd = -1;
+        }
     }
+
+    btrace_cache_clear();
 
     pt_session.pt_event_type = gdb_pt_discover_pmu_type();
     if (pt_session.pt_event_type < 0) {
@@ -352,11 +387,22 @@ static void gdb_handle_qbtrace_pt(GArray *params, void *user_ctx)
     gdb_pt_read_cpu_info();
 
     CPU_FOREACH(cpu) {
+        /* Free any stale buffers for this vCPU (from prior Qbtrace:off
+         * that left them mapped for post-stop reads). */
+        gdb_pt_free_vcpu_buffers(cpu);
+
         ret = gdb_pt_enable_vcpu(cpu);
         if (ret) {
             warn_report("gdbstub PT: failed to enable on vCPU %d: %s",
                         cpu->cpu_index, strerror(-ret));
+        } else {
+            enabled_count++;
         }
+    }
+
+    if (enabled_count == 0) {
+        gdb_put_packet("E.nn");
+        return;
     }
 
     pt_session.active = true;
@@ -376,6 +422,7 @@ static void gdb_handle_qbtrace_off(GArray *params, void *user_ctx)
         gdb_pt_disable_vcpu(cpu);
     }
 
+    btrace_cache_clear();
     pt_session.active = false;
     /* Keep AUX buffers readable for GDB's post-stop trace read.
      * Free them in gdb_pt_cleanup_all() or on next Qbtrace:pt. */
@@ -386,6 +433,7 @@ static void gdb_handle_qxfer_btrace_read(GArray *params, void *user_ctx)
 {
     unsigned long offset, len;
     size_t total_len;
+    bool update_last_head;
     g_autoptr(GString) xml = g_string_sized_new(
         pt_session.buffer_size * 3 + pt_session.buffer_size / 32 * 7 + 300);
 
@@ -410,8 +458,27 @@ static void gdb_handle_qxfer_btrace_read(GArray *params, void *user_ctx)
     offset = gdb_get_cmd_param(params, 1)->val_ul;
     len = gdb_get_cmd_param(params, 2)->val_ul;
 
-    gdb_pt_build_btrace_xml(xml, gdbserver_state.g_cpu);
-    total_len = xml->len;
+    /* GDB sends three annex types for btrace reads:
+     *   all   — full buffer contents (or fresh start after error)
+     *   new   — data accumulated since last read
+     *   delta — peek at new data WITHOUT advancing last_head
+     * For "delta" we must not advance last_head so GDB can retry
+     * if btrace_stitch_trace fails. */
+    update_last_head = strcmp(gdb_get_cmd_param(params, 0)->data, "delta") != 0;
+
+    /* Clear cache when GDB starts a fresh "all" read (offset 0).
+     * Subsequent chunk requests at non-zero offset use the cache. */
+    if (offset == 0) {
+        btrace_cache_clear();
+    }
+
+    if (!btrace_cache) {
+        btrace_cache = g_string_sized_new(
+            pt_session.buffer_size * 3 + pt_session.buffer_size / 32 * 7 + 300);
+        gdb_pt_build_btrace_xml(btrace_cache, gdbserver_state.g_cpu,
+                                update_last_head);
+    }
+    total_len = btrace_cache->len;
 
     if (offset > total_len) {
         gdb_put_packet("E00");
@@ -424,10 +491,10 @@ static void gdb_handle_qxfer_btrace_read(GArray *params, void *user_ctx)
 
     if (len < total_len - offset) {
         g_string_assign(gdbserver_state.str_buf, "m");
-        gdb_memtox(gdbserver_state.str_buf, xml->str + offset, len);
+        gdb_memtox(gdbserver_state.str_buf, btrace_cache->str + offset, len);
     } else {
         g_string_assign(gdbserver_state.str_buf, "l");
-        gdb_memtox(gdbserver_state.str_buf, xml->str + offset,
+        gdb_memtox(gdbserver_state.str_buf, btrace_cache->str + offset,
                    total_len - offset);
     }
 
@@ -508,21 +575,21 @@ static const GdbCmdParseEntry qxfer_btrace_conf_cmd_desc = {
 
 static const GdbCmdParseEntry qbtrace_conf_pt_size_cmd_desc = {
     .handler = gdb_handle_qbtrace_conf_pt_size,
-    .cmd = "btrace-conf:pt:size:",
+    .cmd = "btrace-conf:pt:size=",
     .cmd_startswith = true,
     .schema = "L0"
 };
 
 static const GdbCmdParseEntry qbtrace_conf_pt_ptwrite_cmd_desc = {
     .handler = gdb_handle_qbtrace_conf_pt_ptwrite,
-    .cmd = "btrace-conf:pt:ptwrite:",
+    .cmd = "btrace-conf:pt:ptwrite=",
     .cmd_startswith = true,
     .schema = "s0"
 };
 
 static const GdbCmdParseEntry qbtrace_conf_pt_event_cmd_desc = {
     .handler = gdb_handle_qbtrace_conf_pt_event,
-    .cmd = "btrace-conf:pt:event-tracing:",
+    .cmd = "btrace-conf:pt:event-tracing=",
     .cmd_startswith = true,
     .schema = "s0"
 };
@@ -545,6 +612,8 @@ bool gdb_pt_is_available(void)
 void gdb_pt_cleanup_all(void)
 {
     CPUState *cpu;
+
+    btrace_cache_clear();
 
     if (!pt_session.vcpu) {
         return;
@@ -588,14 +657,18 @@ void gdb_pt_register(void)
     gdb_extend_set_table(sets);
     g_ptr_array_free(sets, FALSE);
 
-    /* Advertise specific btrace features matching gdbserver's format.
-     * GDB requires per-format feature names (Qbtrace:pt+) not Qbtrace+. */
-    gdb_extend_qsupported_features(
-        (char *)";Qbtrace:pt+;Qbtrace:off+;"
-        "Qbtrace-conf:pt:size+;"
-        "Qbtrace-conf:pt:ptwrite+;"
-        "Qbtrace-conf:pt:event-tracing+;"
-        "qXfer:btrace:read+;qXfer:btrace-conf:read+");
+    /* Only advertise PT features when Intel PT PMU is actually available.
+     * Otherwise GDB would see Qbtrace:pt+ in qSupported, attempt to enable
+     * PT, and get E.nn — a protocol-level conflict between advertisement
+     * and runtime capability. */
+    if (gdb_pt_is_available()) {
+        gdb_extend_qsupported_features(
+            (char *)";Qbtrace:pt+;Qbtrace:off+;"
+            "Qbtrace-conf:pt:size+;"
+            "Qbtrace-conf:pt:ptwrite+;"
+            "Qbtrace-conf:pt:event-tracing+;"
+            "qXfer:btrace:read+;qXfer:btrace-conf:read+");
+    }
 }
 
 #endif /* CONFIG_LINUX && I386_CPU_H */
