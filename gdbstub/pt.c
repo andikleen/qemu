@@ -223,7 +223,10 @@ static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu)
     size_t total;
     size_t i;
 
-    if (!vcpu->enabled || !vcpu->aux_buffer || vcpu->aux_size == 0) {
+    /* Allow reads even after Qbtrace:off (vcpu->enabled == false) as long
+     * as the AUX buffer is still mapped.  Perf event DISABLE stops hardware
+     * writes, making the data stable for post-stop reads. */
+    if (!vcpu->aux_buffer || vcpu->aux_size == 0) {
         return;
     }
 
@@ -450,14 +453,25 @@ static void gdb_handle_qxfer_btrace_conf_read(GArray *params, void *user_ctx)
         return;
     }
 
-    g_string_printf(xml,
-        "<!DOCTYPE btrace-conf SYSTEM \"btrace-conf.dtd\">\n"
-        "<btrace-conf version=\"1.0\">\n"
-        "  <pt>\n"
-        "    <size>%" PRIu64 "</size>\n"
-        "  </pt>\n"
-        "</btrace-conf>\n",
-        pt_session.buffer_size);
+    if (pt_session.active) {
+        g_string_printf(xml,
+            "<!DOCTYPE btrace-conf SYSTEM \"btrace-conf.dtd\">\n"
+            "<btrace-conf version=\"1.0\">\n"
+            "  <pt>\n"
+            "    <size>%" PRIu64 "</size>\n"
+            "  </pt>\n"
+            "</btrace-conf>\n",
+            pt_session.buffer_size);
+    } else {
+        /* Only report PT config when recording is active.  GDB's
+         * remote_btrace_maybe_reopen reads this at connect time and would
+         * auto-enable the record target if it sees <pt>, causing a spurious
+         * "already being recorded" error when record btrace pt is called. */
+        g_string_printf(xml,
+            "<!DOCTYPE btrace-conf SYSTEM \"btrace-conf.dtd\">\n"
+            "<btrace-conf version=\"1.0\">\n"
+            "</btrace-conf>\n");
+    }
     total_len = xml->len;
 
     offset = gdb_get_cmd_param(params, 1)->val_ul;
