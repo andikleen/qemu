@@ -33,6 +33,7 @@
 #include "exec/gdbstub.h"
 #include "gdbstub/commands.h"
 #include "gdbstub/syscalls.h"
+#include "pt.h"
 #ifdef CONFIG_USER_ONLY
 #include "accel/tcg/vcpu-state.h"
 #include "gdbstub/user.h"
@@ -1031,6 +1032,8 @@ static void handle_detach(GArray *params, void *user_ctx)
 
         pid = gdb_get_cmd_param(params, 0)->val_ul;
     }
+
+    gdb_pt_cleanup_all();
 
 #ifdef CONFIG_USER_ONLY
     if (gdb_handle_detach_user(pid)) {

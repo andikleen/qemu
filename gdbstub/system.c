@@ -102,6 +102,9 @@ static void gdb_chr_event(void *opaque, QEMUChrEvent event)
         vm_stop(RUN_STATE_PAUSED);
         replay_gdb_attached();
         break;
+    case CHR_EVENT_CLOSED:
+        gdb_pt_cleanup_all();
+        break;
     default:
         break;
     }
@@ -431,6 +434,8 @@ void gdb_exit(int code)
     }
 
     trace_gdbstub_op_exiting((uint8_t)code);
+
+    gdb_pt_cleanup_all();
 
     if (gdbserver_state.allow_stop_reply) {
         snprintf(buf, sizeof(buf), "W%02x", (uint8_t)code);
