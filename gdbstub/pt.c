@@ -229,9 +229,9 @@ static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu,
 {
     GDBPTVCPUState *vcpu = &pt_session.vcpu[cpu->cpu_index];
     struct perf_event_mmap_page *header;
-    uint64_t aux_head, avail, old;
+    uint64_t aux_head;
     uint8_t *raw_data;
-    size_t total;
+    size_t total, data_tail, data_tail_in_buf;
     size_t i;
 
     /* Allow reads even after Qbtrace:off (vcpu->enabled == false) as long
@@ -246,23 +246,30 @@ static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu,
     total = vcpu->aux_size;
 
     aux_head = qatomic_load_acquire(&header->aux_head);
-    old = vcpu->last_head;
-    avail = aux_head - old;
-    if (avail == 0) {
-        return;
+
+    /*
+     * Read the last 'total' bytes of data before aux_head.  This matches
+     * how gdbserver reads the AUX buffer (perf_event_read_all) and handles
+     * circular wrap correctly: the kernel's aux_head is a byte offset into
+     * the buffer (0..total-1), so we extract total bytes ending at aux_head.
+     *
+     * For partial fills (aux_head < total), we add total so data_tail
+     * doesn't underflow; the "extra" bytes cover stale buffer data which
+     * libipt ignores (it scans for valid PSB markers).
+     */
+    {
+        uint64_t head_for_tail = aux_head;
+        if (head_for_tail < total) {
+            head_for_tail += total;
+        }
+        data_tail = head_for_tail - total;
     }
 
-    for (i = 0; i < avail; i++) {
-        size_t idx = (old + i) & (total - 1);
+    data_tail_in_buf = data_tail & (total - 1);
+
+    for (i = 0; i < total; i++) {
+        size_t idx = (data_tail_in_buf + i) & (total - 1);
         uint8_t byte = raw_data[idx];
-        if (i > 0) {
-            if ((i % 32) == 0) {
-                g_string_append_c(buf, '\n');
-                g_string_append(buf, "      ");
-            } else {
-                g_string_append_c(buf, ' ');
-            }
-        }
         g_string_append_c(buf, gdb_pt_hex[(byte >> 4) & 0xf]);
         g_string_append_c(buf, gdb_pt_hex[byte & 0xf]);
     }
@@ -275,10 +282,10 @@ static void gdb_pt_read_vcpu_raw(GString *buf, CPUState *cpu,
 static void gdb_pt_build_btrace_xml(GString *xml, CPUState *cpu,
                                      bool update_last_head)
 {
-    /* Preallocate for worst-case hex encoding: each AUX byte → "XX " (3 chars),
-     * plus newline+indent every 32 lines, plus XML wrappers ~300 bytes. */
+    /* Preallocate for hex encoding: 2 chars per AUX byte plus XML
+     * wrapper ~300 bytes.  No separators (matches gdbserver format). */
     g_autoptr(GString) raw = g_string_sized_new(
-        pt_session.buffer_size * 3 + pt_session.buffer_size / 32 * 7 + 300);
+        pt_session.buffer_size * 2 + 300);
 
     gdb_pt_read_vcpu_raw(raw, cpu, update_last_head);
 
@@ -322,6 +329,8 @@ static void gdb_handle_qbtrace_conf_pt_size(GArray *params, void *user_ctx)
  * "off", or quoted "\"yes\""/"\"no\"".  Returns true for truthy values. */
 static bool gdb_pt_parse_bool(const char *val)
 {
+    size_t len;
+
     if (!val) {
         return false;
     }
@@ -329,8 +338,13 @@ static bool gdb_pt_parse_bool(const char *val)
     while (*val == '"') {
         val++;
     }
-    return strcmp(val, "yes") == 0 || strcmp(val, "on") == 0 ||
-           strcmp(val, "1") == 0;
+    len = strlen(val);
+    while (len > 0 && val[len - 1] == '"') {
+        len--;
+    }
+    return (len == 3 && strncmp(val, "yes", 3) == 0) ||
+           (len == 2 && strncmp(val, "on", 2) == 0) ||
+           (len == 1 && val[0] == '1');
 }
 
 static void gdb_handle_qbtrace_conf_pt_ptwrite(GArray *params, void *user_ctx)
@@ -434,8 +448,6 @@ static void gdb_handle_qxfer_btrace_read(GArray *params, void *user_ctx)
     unsigned long offset, len;
     size_t total_len;
     bool update_last_head;
-    g_autoptr(GString) xml = g_string_sized_new(
-        pt_session.buffer_size * 3 + pt_session.buffer_size / 32 * 7 + 300);
 
     if (params->len < 3) {
         gdb_put_packet("E22");
